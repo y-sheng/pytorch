@@ -467,6 +467,15 @@ struct MethodValue : public SugaredValue {
         }
         schemas.push_back(&method.getSchema());
       } else if (auto interface_type = self_->type()->cast<InterfaceType>()) {
+        // If the method being called on the interface has arguments whose names
+        // were ignored during subtyping checks, err on the side of caution and
+        // prohibit calling the method with kwargs.
+        auto ignored_arg_names = interface_type->ignored_arg_names();
+        if ((ignored_arg_names.find(method_name) != ignored_arg_names.end()) &&
+            !kwargs.empty()) {
+          throw ErrorReport(loc)
+              << method_name << " cannot be called with keyword arguments";
+        }
         schemas.push_back(interface_type->getMethod(method_name));
       } else {
         TORCH_INTERNAL_ASSERT(
