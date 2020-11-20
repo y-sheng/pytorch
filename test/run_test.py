@@ -391,6 +391,24 @@ def test_cpp_extensions_aot_no_ninja(test_module, test_directory, options):
     return _test_cpp_extensions_aot('test_cpp_extensions_aot',
                                     test_directory, options, use_ninja=False)
 
+def test_rpc(test_module, test_directory, options):
+    for use_tcp_init in [True, False]:
+        if use_tcp_init:
+            if options.verbose:
+                print_to_stderr("Running RPC tests with TCP init_method")
+            os.environ["RPC_INIT_WITH_TCP"] = "1"
+        else:
+            if options.verbose:
+                print_to_stderr("Running RPC tests with FILE init_method")
+        return_code = run_test(test_module, test_directory, options)
+        if return_code != 0:
+            return return_code
+
+        # Clear environment variable for future runs
+        if os.environ.get("RPC_INIT_WITH_TCP", None) is not None:
+            del os.environ["RPC_INIT_WITH_TCP"]
+
+    return 0
 
 def test_distributed(test_module, test_directory, options):
     mpi_available = subprocess.call('command -v mpiexec', shell=True) == 0
@@ -455,6 +473,9 @@ CUSTOM_HANDLERS = {
     'test_cpp_extensions_aot_ninja': test_cpp_extensions_aot_ninja,
     'distributed/test_distributed_fork': test_distributed,
     'distributed/test_distributed_spawn': test_distributed,
+    'distributed/rpc/test_process_group_agent': test_rpc,
+    'distributed/rpc/test_tensorpipe_agent': test_rpc,
+    'distributed/rpc/test_faulty_agent': test_rpc,
 }
 
 
