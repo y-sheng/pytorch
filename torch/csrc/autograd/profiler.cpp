@@ -312,6 +312,14 @@ struct ProfilerThreadLocalState : public c10::MemoryReportingInfoBase {
     return config_.profile_memory;
   }
 
+  void profileStart() {
+    at::setRecordAllFunctionsLocal();
+  }
+
+  void profileEnd() {
+    at::unsetRecordAllFunctionsLocal();
+  }
+
  private:
   std::vector<FileLineFunc> prepareCallstack(const std::vector<jit::StackEntry>& cs) {
     std::vector<FileLineFunc> entries;
@@ -548,6 +556,7 @@ void enableProfiler(const ProfilerConfig& new_config) {
     });
   }
   state->mark("__start_profile", false);
+  state->profileStart();
 }
 
 thread_event_lists disableProfiler(c10::optional<ProfilerDisableOptions> profilerDisableOptions) {
@@ -564,6 +573,8 @@ thread_event_lists disableProfiler(c10::optional<ProfilerDisableOptions> profile
   auto state_ptr = static_cast<ProfilerThreadLocalState*>(state.get());
   TORCH_CHECK(state_ptr && state_ptr->config().state != ProfilerState::Disabled,
       "Can't disable profiler when it's not running");
+
+  state_ptr->profileEnd();
 
   if (cleanupTLSState) {
     at::removeCallback(state_ptr->callbackHandle());
