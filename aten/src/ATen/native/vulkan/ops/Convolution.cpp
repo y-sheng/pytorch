@@ -42,10 +42,10 @@ vTensor pack_weights(
 
   if (is_depthwise(src_filter, groups)) {
     vTensor v_weight{
-      api::context(),
-      &pool,
-      src_filter,
-      weight.options(),
+        api::context(),
+        &pool,
+        src_filter,
+        weight.options(),
     };
 
     using Future = vTensor::Future<void, vTensor::Access::Write>;
@@ -66,16 +66,26 @@ vTensor pack_weights(
 
   using namespace api::utils;
 
+  const int64_t num_stacks = div_up(src_filter[Layout::Filter::output], 4);
+  const int64_t stack_depth =
+      4 * api::utils::align_up(src_filter[Layout::Filter::input], 4);
+  const int64_t max_stacks_per_tower =
+      at::native::vulkan::api::MAX_STACK_DEPTH / stack_depth;
+  const int64_t num_towers = div_up(num_stacks, max_stacks_per_tower);
+  int64_t stacks_per_tower = num_stacks;
+  if (num_towers > 1) {
+    stacks_per_tower = div_up(num_stacks, num_towers);
+  }
   vTensor v_weight{
-    api::context(),
-    &pool,
-    {
-      div_up(src_filter[Layout::Filter::output], 4),
-      4 * align_up(src_filter[Layout::Filter::input], 4),
-      src_filter[Layout::Filter::height],
-      src_filter[Layout::Filter::width],
-    },
-    weight.options(),
+      api::context(),
+      &pool,
+      {
+          stacks_per_tower,
+          stack_depth,
+          src_filter[Layout::Filter::height] * num_towers,
+          src_filter[Layout::Filter::width],
+      },
+      weight.options(),
   };
 
   using Future = vTensor::Future<float, vTensor::Access::Write>;
@@ -83,38 +93,49 @@ vTensor pack_weights(
   Future::Payload v_weight_payload = v_weight_future.wait();
 
   /* Source */
-  const int64_t src_kernel = src_filter[Layout::Filter::height] * src_filter[Layout::Filter::width];
-  const int64_t src_block = src_kernel * src_filter[Layout::Filter::input];
+  const int64_t src_kw_sz = src_filter[Layout::Filter::width];
+  const int64_t src_kh_sz = src_filter[Layout::Filter::height];
+  const int64_t src_kernel_sz = src_kw_sz * src_kh_sz;
+  const int64_t src_block_sz =
+      src_kernel_sz * src_filter[Layout::Filter::input];
 
   /* Destination */
   const IntArrayRef dst_filter = v_weight.sizes();
-  const int64_t dst_kernel = dst_filter[Layout::Filter::height] * dst_filter[Layout::Filter::width];
-  const int64_t dst_block = dst_kernel * dst_filter[Layout::Filter::input];
-  TORCH_INTERNAL_ASSERT(src_kernel == dst_kernel, "Internal error!");
+  const int64_t dst_kw_sz = src_filter[Layout::Filter::width];
+  const int64_t dst_kh_sz = src_filter[Layout::Filter::height] * num_towers;
+  const int64_t dst_kernel_sz = dst_kw_sz * dst_kh_sz;
+  const int64_t dst_block_sz =
+      dst_kernel_sz * dst_filter[Layout::Filter::input];
+  // TORCH_INTERNAL_ASSERT(src_kernel_sz == dst_kernel_sz, "Internal error!");
 
   float* const dst_weight_ptr = v_weight_payload.get();
   memset(dst_weight_ptr, 0, v_weight.nbytes());
 
-  for (int64_t src_oc = 0; src_oc < src_filter[Layout::Filter::output]; ++src_oc) {
-    /* Source */
-    const float *const src_weight_oc_ptr = src_weight_ptr + src_oc * src_block;
+  for (int64_t i_tower = 0; i_tower < num_towers; ++i_tower) {
+    const float* const src_tower_ptr =
+        src_weight_ptr + (i_tower * stacks_per_tower * 4) * src_block_sz;
+    for (int64_t src_oc = 0; src_oc < (stacks_per_tower * 4); ++src_oc) {
+      /* Source */
+      const float* const src_weight_oc_ptr =
+          src_tower_ptr + src_oc * src_block_sz;
 
-    /* Destination */
-    const int64_t dst_oc = src_oc / 4;
-    const int64_t dst_oc_offset = src_oc % 4;
+      /* Destination */
+      const int64_t dst_oc = src_oc / 4;
+      const int64_t dst_oc_offset = src_oc % 4;
 
-    float* const dst_weight_oc_ptr =
-        dst_weight_ptr +
-        dst_oc * dst_block +
-        dst_oc_offset * dst_kernel;
+      float* const dst_weight_oc_ptr = dst_weight_ptr + dst_oc * dst_block_sz +
+          dst_oc_offset * dst_kernel_sz;
 
-    for (int64_t src_ic = 0; src_ic < src_filter[Layout::Filter::input]; ++src_ic) {
-      const int64_t dst_ic = 4 * src_ic;
+      for (int64_t src_ic = 0; src_ic < src_filter[Layout::Filter::input];
+           ++src_ic) {
+        const int64_t dst_ic = 4 * src_ic;
 
-      memcpy(
-          dst_weight_oc_ptr + dst_ic * dst_kernel,
-          src_weight_oc_ptr + src_ic * src_kernel,
-          sizeof(float) * dst_kernel);
+        memcpy(
+            dst_weight_oc_ptr + dst_ic * dst_kernel_sz +
+                (i_tower * src_kernel_sz),
+            src_weight_oc_ptr + src_ic * src_kernel_sz,
+            sizeof(float) * src_kernel_sz);
+      }
     }
   }
 
@@ -339,31 +360,14 @@ void conv2d_pointwise(
   using namespace api::utils;
 
   if (v_output.has_image() && v_input.has_image() && v_weight.has_image()) {
-    
-    vTensor v_weight_reshaped{
-        context,
-        {1,1, v_weight.sizes()[0], v_weight.sizes()[1]},
-        v_input.options(),
-    };
-
-    api::Command::Buffer temp_command_buffer =
-        api::context()->command().pool.allocate();
-    temp_command_buffer.begin();
-
-    temp_command_buffer.copy(
-        v_weight.buffer(temp_command_buffer),
-        v_weight_reshaped.buffer(temp_command_buffer, vTensor::Access::Write)
-    );
-
-    temp_command_buffer.end();
-    temp_command_buffer.submit(api::context()->gpu().queue);
+    const int64_t stacks_per_tower = v_weight.sizes()[0];
 
     const struct {
       int32_t kernel_ic, kernel_oc;
       int32_t stride_x, stride_y;
       int32_t padding_x, padding_y;
       float clamp_x, clamp_y;
-      int32_t w;
+      int32_t stacks_per_tower;
     } block {
       safe_downcast<int32_t>(filter[Layout::Filter::input]),
       safe_downcast<int32_t>(filter[Layout::Filter::output]),
@@ -373,7 +377,7 @@ void conv2d_pointwise(
       safe_downcast<int32_t>(padding[Layout::Parameter::height]),
       output_min,
       output_max,
-      v_weight.sizes()[1],
+      safe_downcast<int32_t>(stacks_per_tower),
     };
 
     context->dispatch(
@@ -395,7 +399,7 @@ void conv2d_pointwise(
         v_input.image(command_buffer),
         // Read-only access is implied on const tensors and triggers an async
         // synchronization if necessary.
-        v_weight_reshaped.image(command_buffer, vTensor::Access::Read),
+        v_weight.image(command_buffer),
         // Read-only access is implied on const tensors and triggers an async
         // synchronization if necessary.
         v_bias.buffer(command_buffer),
@@ -424,12 +428,14 @@ void conv2d(
   using namespace api::utils;
 
   if (v_output.has_image() && v_input.has_image() && v_weight.has_image()) {
+    const int64_t stacks_per_tower = v_weight.sizes()[0];
     const struct {
       int32_t kernel_x, kernel_y, kernel_ic, kernel_oc;
       int32_t stride_x, stride_y;
       int32_t padding_x, padding_y;
       int32_t dilate_x, dilate_y;
       float clamp_x, clamp_y;
+      int32_t stacks_per_tower;
     } block {
       safe_downcast<int32_t>(filter[Layout::Filter::width]),
       safe_downcast<int32_t>(filter[Layout::Filter::height]),
@@ -443,6 +449,7 @@ void conv2d(
       safe_downcast<int32_t>(dilation[Layout::Parameter::height]),
       output_min,
       output_max,
+      safe_downcast<int32_t>(stacks_per_tower),
     };
 
     context->dispatch(
@@ -706,7 +713,7 @@ c10::intrusive_ptr<Conv2dOpContext> conv2d_clamp_prepack(
           /* output_padding = */ {},
           groups,
           output_min,
-          output_min));
+          output_max));
 }
 
 Tensor conv2d_clamp_run(
