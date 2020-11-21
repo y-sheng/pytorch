@@ -1265,6 +1265,20 @@ static const auto ProcessGroupWorkTorchBind =
 // TODO: Support argument names in Python API.
 static const auto ProcessGroupTorchBind =
     torch::class_<::c10d::ProcessGroup>("dist_c10d", "ProcessGroup")
+        .def_pickle(
+            [](const c10::intrusive_ptr<::c10d::ProcessGroup>& self) {
+              auto name =
+                  ::c10d::DistributedC10d::get()->getNameOfProcessGroup(self);
+              return std::vector<std::string>{name};
+            },
+            [](std::vector<std::string> state) {
+              TORCH_CHECK(
+                  state.size() == 1,
+                  "Expecting exactly 1 state when restoring ProcessGroup, got: ",
+                  state.size());
+              return ::c10d::DistributedC10d::get()->getProcessGroupByName(
+                  state.front());
+            })
         .def(
             "rank",
             [](const c10::intrusive_ptr<::c10d::ProcessGroup>& self) {
@@ -1529,6 +1543,22 @@ static const auto ProcessGroupNCCLOptionsTorchBind =
 
 static const auto ProcessGroupNCCLTorchBind =
     torch::class_<::c10d::ProcessGroupNCCL>("dist_c10d", "ProcessGroupNCCL")
+        .def_pickle(
+            [](const c10::intrusive_ptr<::c10d::ProcessGroupNCCL>& self) {
+              auto base_process_group =
+                  static_cast<c10::intrusive_ptr<::c10d::ProcessGroup>>(self);
+              auto name =
+                  ::c10d::DistributedC10d::get()->getNameOfProcessGroup(self);
+              return std::vector<std::string>{name};
+            },
+            [](std::vector<std::string> state) {
+              TORCH_CHECK(
+                  state.size() == 1,
+                  "Expecting exactly 1 state when restoring ProcessGroupNCCL, got: ",
+                  state.size());
+              auto base_process_group = ::c10d::DistributedC10d::get()->getProcessGroupByName(state.front());
+              return static_cast<c10::intrusive_ptr<ProcessGroupNCCL>>(base_process_group);
+            })
         .def(torch::init<
              const c10::intrusive_ptr<::c10d::Store>&,
              int64_t,
@@ -1552,13 +1582,16 @@ static const auto ProcessGroupNCCLTorchBind =
 
 static const auto DistributedC10dFrontendTorchBind =
     torch::class_<::c10d::DistributedC10d>("c10d", "frontend")
-        .def(torch::init([]() {
-          static c10::intrusive_ptr<::c10d::DistributedC10d>
-              c10d_frontend_singleton =
-                  c10::make_intrusive<::c10d::DistributedC10d>();
-          return c10d_frontend_singleton;
-        }))
-        .def("new_process_group_helper", &::c10d::DistributedC10d::newProcessGroupHelper);
+        .def(torch::init([]() { return ::c10d::DistributedC10d::get(); }))
+        .def(
+            "new_process_group_helper",
+            &::c10d::DistributedC10d::newProcessGroupHelper)
+        .def(
+            "get_process_group_by_name",
+            &::c10d::DistributedC10d::getProcessGroupByName)
+        .def(
+            "get_name_of_process_group",
+            &::c10d::DistributedC10d::getNameOfProcessGroup);
 
 } // namespace
 
